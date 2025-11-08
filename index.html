@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MR Tree Decorating — Tap to Place + Grab & Throw</title>
+
+  <!-- A-Frame -->
+  <script src="https://cdn.jsdelivr.net/npm/aframe@1.4.2/dist/aframe.min.js"></script>
+  <!-- A-Frame AR helpers -->
+  <script src="https://cdn.jsdelivr.net/npm/aframe-ar-hit-test-component@1.0.3/dist/aframe-ar-hit-test-component.min.js"></script>
+  <!-- three.js STLLoader (A-Frame already includes three, but loader is external) -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.154.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.154.0/examples/js/loaders/STLLoader.js"></script>
+
+  <!-- physics and interactions -->
+  <script src="https://cdn.jsdelivr.net/gh/n5ro/aframe-physics-system@v4.0.1/dist/aframe-physics-system.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/wmurphyrd/aframe-super-hands-component@7.0.3/dist/aframe-super-hands.min.js"></script>
+  <style>
+    body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP"; }
+    #ui {
+      position: absolute; left: 12px; top: 12px; z-index: 10;
+      background: rgba(0,0,0,0.5); color: white; padding: 8px 10px; border-radius: 6px;
+      max-width: 360px; font-size: 13px;
+    }
+    #placeHint { display:inline-block; margin-top:6px; color:#ffd; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    Tap the floor to place the tree.  
+    Use your controller to spawn an ornament (A-button / X-button) and grab with trigger.  
+    Throw it at the tree — it will snap and twinkle on contact.
+    <div id="placeHint"></div>
+  </div>
+
+  <!-- A-Frame scene: request AR features (hit-test + anchors) and immersive-ar -->
+  <a-scene
+    vr-mode-ui="enabled: true"
+    webxr="optionalFeatures: hit-test, anchors, local-floor, bounded-floor; requiredFeatures: hit-test; sessionMode: immersive-ar"
+    ar-hit-test
+    physics="gravity: -9.8; debug: false"
+    background="color: #00000000"> <!-- transparent background so passthrough shows through -->
+    
+    <!-- Reticle for tapping/placement (ar-hit-test provides events) -->
+    <a-entity id="reticle" visible="false" geometry="primitive: ring; radiusInner: 0.03; radiusOuter: 0.05"
+              material="color: #ffff66; side: double; shader: flat" rotation="-90 0 0"></a-entity>
+
+    <!-- root holder -->
+    <a-entity id="root"></a-entity>
+
+    <!-- Camera rig (center of view) -->
+    <a-entity id="cameraRig" position="0 1.6 0">
+      <a-entity camera look-controls></a-entity>
+
+      <!-- Right hand (controller-based). Buttons used: primary button spawns ornament. -->
+      <a-entity id="rightHand"
+                hand-controls="hand: right"
+                oculus-touch-controls="hand: right"
+                super-hands
+                raycaster="objects: .grabbable"
+                ></a-entity>
+
+      <!-- Left hand -->
+      <a-entity id="leftHand"
+                hand-controls="hand: left"
+                oculus-touch-controls="hand: left"
+                super-hands
+                raycaster="objects: .grabbable"
+                ></a-entity>
+    </a-entity>
+
+    <!-- small ground plane for physics reference (invisible) -->
+    <a-plane id="physicsGround" rotation="-90 0 0" width="20" height="20" visible="false" static-body></a-plane>
+  </a-scene>
+
+<script>
+/* -------------------------
+ Configuration
+------------------------- */
+const TREE_STL = 'tree.stl';
+const ORNAMENT_STL = 'ornament.stl';
+const ORNAMENT_SCALE = 0.02;    // adjust to fit your STL sizes
+const ORNAMENT_OFFSET = 0.02;   // how far out from tree surface to place
+const SPAWN_DISTANCE = 0.3;     // spawn ornament this far in front of camera
+const MAX_ORNAMENTS = 50;
+
+/* -------------------------
+ Utilities: STL loader
+------------------------- */
+function loadSTL(url) {
+  return new Promise((resolve, reject) => {
+    const loader = new THREE.STLLoader();
+    loader.load(url, g => resolve(g), undefined, e => reject(e));
+  });
+}
+
+/* -------------------------
+ Main flow
+ - Wait for AR ready (ar-hit-test events)
+ - Place tree on tap (floor placement)
+ - Allow spawning ornament with controller primary button
+ - Allow grab/throw via super-hands
+ - Detect collision ornament vs tree -> snap + twinkle + make static
+------------------------- */
+AFRAME.registerComponent('mr-decorator', {
+  init: function () {
+    const scene = this.el.sceneEl;
+    this.treeEntity = null;
+    this.treeMeshThree = null;
+    this.ornamentCount = 0;
+    this.ornaments = [];
+
+    // load models
+    Promise.all([loadSTL(TREE_STL), loadSTL(ORNAMENT_STL)])
+      .then(([treeGeo, ornamentGeo]) => {
+        // create three meshes (not yet placed)
+        treeGeo.computeBoundingBox();
+        const bb = treeGeo.boundingBox;
+        const treeHeight = bb.max.y - bb.min.y;
+        const targetHeight = 1.2;
+        const treeScale = targetHeight / treeHeight;
+
+        const treeMat = new THREE.MeshStandardMaterial({ color:0x0b8a3e, roughness:0.8, metalness:0.1 });
+        const treeMesh = new THREE.Mesh(treeGeo, treeMat);
+        treeMesh.scale.setScalar(treeScale);
+        // center and set base to y=0
+        treeGeo.computeBoundingBox();
+        const center = new THREE.Vector3();
+        treeGeo.boundingBox.getCenter(center);
+        treeMesh.position.set(-center.x * treeScale, -treeGeo.boundingBox.min.y * treeScale, -center.z * treeScale);
+
+        // ornament template
+        const ornamentMat = new THREE.MeshStandardMaterial({ color:0xff4444, metalness:0.6, roughness:0.3 });
+        const ornamentMeshTemplate = new THREE.Mesh(ornamentGeo, ornamentMat);
+        ornamentMeshTemplate.scale.setScalar(ORNAMENT_SCALE);
+
+        // save for later
+        this.treeMeshThree = treeMesh;
+        this.treeThreeGeo = treeGeo;
+        this.ornamentTemplate = ornamentMeshTemplate;
+
+        console.log('Models loaded');
+      })
+      .catch(err => {
+        console.error('Model load error', err);
+        alert('モデルの読み込みに失敗しました。tree.stl / ornament.stl を確認してください。');
+      });
+
+    // respond to ar-hit-test events from aframe-ar-hit-test
+    // when hit test sees a surface, we show reticle; on select (tap) place tree
+    scene.addEventListener('ar-hit-test-achieved', (evt) => {
+      const ret = document.querySelector('#reticle');
+      ret.object3D.position.copy(evt.detail.position);
+      ret.object3D.quaternion.copy(evt.detail.rotation);
+      ret.setAttribute('visible', 'true');
+      document.getElementById('placeHint').innerText = 'Tap to place the tree here';
+    });
+    scene.addEventListener('ar-hit-test-lost', () => {
+      document.querySelector('#reticle').setAttribute('visible', 'false');
+      document.getElementById('placeHint').innerText = '';
+    });
+    scene.addEventListener('ar-hit-test-select', (evt) => {
+      // user tapped to place; evt.detail has position & rotation
+      if (!this.treeMeshThree) {
+        console.warn('tree model not ready yet');
+        return;
+      }
+      if (this.treeEntity) {
+        console.log('Tree already placed');
+        return;
+      }
+      const pos = evt.detail.position;
+      const rot = evt.detail.rotation;
+
+      // create a new a-entity wrapper to host the tree (and add physics static-body)
+      const treeEnt = document.createElement('a-entity');
+      treeEnt.setAttribute('id','placed-tree');
+      // convert three.Mesh to aframe by adding to object3D
+      // but we also want collision: so we will add a visual object + invisible collider mesh (approx)
+      treeEnt.addEventListener('model-loaded', ()=>{});
+      this.el.appendChild(treeEnt);
+
+      // add three object
+      treeEnt.object3D.add(this.treeMeshThree.clone());
+
+      // position the wrapper at hit location (we already built tree mesh centered)
+      treeEnt.object3D.position.copy(pos);
+      treeEnt.object3D.quaternion.copy(rot);
+
+      // add a static-body for physics collision (approximate using bounding box box)
+      // compute bounding box of the scaled tree
+      const box = new THREE.Box3().setFromObject(treeEnt.object3D);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      // create an invisible box entity as collider
+      const collider = document.createElement('a-box');
+      collider.setAttribute('width', size.x.toFixed(3));
+      collider.setAttribute('height', size.y.toFixed(3));
+      collider.setAttribute('depth', size.z.toFixed(3));
+      collider.setAttribute('position', '0 ' + (size.y/2).toFixed(3) + ' 0'); // anchored at base
+      collider.setAttribute('material','opacity:0; transparent:true');
+      collider.setAttribute('static-body','');
+      treeEnt.appendChild(collider);
+
+      this.treeEntity = treeEnt;
+      console.log('Tree placed at', pos);
+      document.getElementById('placeHint').innerText = 'Tree placed. Press controller primary button to spawn an ornament.';
+    });
+
+    // Controller primary button to spawn an ornament in front of camera
+    const rightHand = document.querySelector('#rightHand');
+    const leftHand = document.querySelector('#leftHand');
+    const cameraRig = document.querySelector('#cameraRig');
+
+    // helper: spawn ornament at camera front or at controller
+    const spawnOrnament = (spawnPos, spawnQuat) => {
+      if (!this.ornamentTemplate) return;
+      if (this.ornaments.length >= MAX_ORNAMENTS) return;
+
+      // create a three mesh clone and wrap into an a-entity for physics
+      const mesh = this.ornamentTemplate.clone();
+      const wrapper = document.createElement('a-entity');
+      wrapper.classList.add('ornament');
+      wrapper.classList.add('grabbable');
+      // create placeholder geometry to present; we'll attach three.js object
+      wrapper.setAttribute('position', `${spawnPos.x.toFixed(3)} ${spawnPos.y.toFixed(3)} ${spawnPos.z.toFixed(3)}`);
+      wrapper.setAttribute('dynamic-body', 'mass:0.3; restitution:0.2');
+      wrapper.setAttribute('grabbable','');
+      wrapper.setAttribute('grab-listener',''); // custom component to manage snap-on-collision
+      // attach three object after next tick
+      wrapper.addEventListener('body-loaded', ()=>{});
+      this.el.appendChild(wrapper);
+      // put three object into wrapper.object3D
+      wrapper.object3D.add(mesh);
+      mesh.position.set(0,0,0);
+      if (spawnQuat) mesh.quaternion.copy(spawnQuat);
+      // keep reference
+      this.ornaments.push(wrapper);
+
+      // allow super-hands to pick up (super-hands uses intersection with object3D)
+      // (No extra steps needed — class .grabbable helps the raycaster)
+      return wrapper;
+    };
+
+    // create a small system to listen for controller buttondown
+    // Use standard Gamepad mapping: primary button triggers 'abutton' event in A-Frame for Oculus?
+    // We'll listen for controller buttondown via gamepadconnected / axes? Simpler: use 'abuttondown' event from hand-controls
+    rightHand.addEventListener('abuttondown', (ev)=> {
+      // spawn in front of camera
+      const camObj = scene.camera.el.object3D;
+      const spawnWorld = new THREE.Vector3();
+      camObj.getWorldDirection(spawnWorld);
+      const camPos = new THREE.Vector3();
+      camObj.getWorldPosition(camPos);
+      const spawnPos = camPos.clone().add(spawnWorld.multiplyScalar(SPAWN_DISTANCE));
+      spawnOrnament(spawnPos);
+    });
+    leftHand.addEventListener('abuttondown', (ev)=> {
+      const camObj = scene.camera.el.object3D;
+      const spawnWorld = new THREE.Vector3();
+      camObj.getWorldDirection(spawnWorld);
+      const camPos = new THREE.Vector3();
+      camObj.getWorldPosition(camPos);
+      const spawnPos = camPos.clone().add(spawnWorld.multiplyScalar(SPAWN_DISTANCE));
+      spawnOrnament(spawnPos);
+    });
+
+    // Also support keyboard 'o' for desktop testing
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'o') {
+        const camObj = scene.camera.el.object3D;
+        const spawnWorld = new THREE.Vector3();
+        camObj.getWorldDirection(spawnWorld);
+        const camPos = new THREE.Vector3();
+        camObj.getWorldPosition(camPos);
+        const spawnPos = camPos.clone().add(spawnWorld.multiplyScalar(SPAWN_DISTANCE));
+        spawnOrnament(spawnPos);
+      }
+    });
+
+    // collision detection: listen for collisions from physics system
+    // We'll add a small collision-listener component to ornaments that notifies on contact with tree collider
+    AFRAME.registerComponent('grab-listener', {
+      init: function() {
+        // when this entity collides with something, ammo physics emits 'collide' event on element
+        this.el.addEventListener('collide', (e) => {
+          const other = e.detail.body.el; // a-entity collided with
+          if (!other) return;
+          if (!other.parentElement) return;
+          // detect tree collider parent by id 'placed-tree' or class
+          let cur = other;
+          while (cur) {
+            if (cur.id === 'placed-tree') {
+              // Snap this ornament to tree surface
+              snapOrnamentToTree(this.el, e);
+              break;
+            }
+            cur = cur.parentElement;
+          }
+        });
+      }
+    });
+
+    // Snap function: convert dynamic to static, align to surface normal using contact info if available
+    const snapOrnamentToTree = (ornamentEl, collideEvent) => {
+      // Avoid double-snap
+      if (ornamentEl.classList.contains('snapped')) return;
+      ornamentEl.classList.add('snapped');
+
+      // Remove physics dynamic-body to fix in place: replace with static-body at final transform
+      // get world position and normal approximation from collideEvent.detail.contact
+      let contactPos = null;
+      let contactNormal = null;
+      if (collideEvent && collideEvent.detail && collideEvent.detail.contact) {
+        const c = collideEvent.detail.contact;
+        contactPos = new THREE.Vector3(c.contactPoint.x, c.contactPoint.y, c.contactPoint.z);
+        // contact normal in Ammo space - approximate: use normal on B
+        contactNormal = new THREE.Vector3(c.contactNormal.x, c.contactNormal.y, c.contactNormal.z);
+      } else {
+        // fallback: use object's current world position & look vector
+        const worldPos = new THREE.Vector3();
+        ornamentEl.object3D.getWorldPosition(worldPos);
+        contactPos = worldPos;
+        const forward = new THREE.Vector3(0,0,1);
+        ornamentEl.object3D.getWorldDirection(forward);
+        contactNormal = forward.multiplyScalar(-1);
+      }
+
+      // transform to local of treeEntity
+      const treeObj = (document.querySelector('#placed-tree') || document.querySelector('#placed-tree'));
+      if (!treeObj) return;
+      const invMat = new THREE.Matrix4().getInverse(treeObj.object3D.matrixWorld);
+      const localPos = contactPos.clone().applyMatrix4(invMat);
+      // apply offset along normal to push ornament a little out of surface
+      const worldNormal = contactNormal.clone().normalize();
+      const worldPosWithOffset = contactPos.clone().add(worldNormal.clone().multiplyScalar(ORNAMENT_OFFSET));
+      // set ornament world transform to this position & orient so its +Z faces outward
+      ornamentEl.object3D.position.copy(worldPosWithOffset);
+      // compute quaternion to align +Z to worldNormal
+      const zAxis = new THREE.Vector3(0,0,1);
+      const q = new THREE.Quaternion().setFromUnitVectors(zAxis, worldNormal);
+      ornamentEl.object3D.quaternion.copy(q);
+
+      // detach physics: remove dynamic-body attribute and add static-body so it stays collision object
+      if (ornamentEl.hasAttribute('dynamic-body')) ornamentEl.removeAttribute('dynamic-body');
+      ornamentEl.setAttribute('static-body','');
+
+      // visually lock: small scale bounce + twinkle
+      ornamentEl.setAttribute('animation__scale', {
+        property: 'scale',
+        to: '1.2 1.2 1.2',
+        dur: 220,
+        dir: 'alternate',
+        loop: 2,
+        easing: 'easeOutQuad'
+      });
+
+      // add twinkle particle / glow
+      addTwinkle(ornamentEl);
+
+      // optional: mark as fixed / play sound
+      console.log('Ornament snapped to tree');
+    };
+
+    // simple twinkle: create an ephemeral sprite that fades
+    const addTwinkle = (parentEl) => {
+      const tw = document.createElement('a-entity');
+      tw.setAttribute('position','0 0 0');
+      // use a ring that scales and fades
+      tw.setAttribute('geometry','primitive: ring; radiusInner: 0.03; radiusOuter: 0.06');
+      tw.setAttribute('material','color: #ffd700; shader: flat; opacity: 0.9; transparent: true');
+      parentEl.appendChild(tw);
+      // animate scale+opacity then remove
+      tw.setAttribute('animation__scale', {
+        property: 'scale', to: '1.8 1.8 1.8', dur: 500, easing: 'easeOutQuad'
+      });
+      tw.setAttribute('animation__fade', {
+        property: 'material.opacity', to: 0.0, dur: 500, easing: 'linear'
+      });
+      setTimeout(()=> tw.remove(), 520);
+      // also add a subtle emissive pulse on the ornament mesh if present
+      const threeObj = parentEl.object3D.children[0];
+      if (threeObj && threeObj.material) {
+        const origEmiss = threeObj.material.emissive ? threeObj.material.emissive.clone() : new THREE.Color(0x000000);
+        // animate via requestAnimationFrame for a short pulse
+        let t = 0;
+        const dur = 500;
+        const start = performance.now();
+        function pulse(now) {
+          t = (now - start) / dur;
+          if (t > 1) {
+            threeObj.material.emissive.setHex(0x000000);
+            return;
+          }
+          const intensity = Math.sin(t * Math.PI) * 0.6; // peak then down
+          threeObj.material.emissive.setRGB(intensity, intensity*0.8, intensity*0.2);
+          requestAnimationFrame(pulse);
+        }
+        requestAnimationFrame(pulse);
+      }
+    };
+
+    // expose to global for debug
+    window._mrDecorator = this;
+  }
+});
+
+/* attach the component to scene root */
+document.querySelector('a-scene').setAttribute('mr-decorator','');
+</script>
+</body>
+</html>
